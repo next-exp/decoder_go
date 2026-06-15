@@ -2,6 +2,7 @@ package decoder
 
 import (
 	"fmt"
+	"strings"
 
 	_ "github.com/go-sql-driver/mysql"
 	sqlx "github.com/jmoiron/sqlx" //make alias name the package to sqlx
@@ -72,8 +73,9 @@ type HuffmanCode struct {
 }
 
 type SensorMappingEntry struct {
-	ElecID   int `db:"ElecID"`
-	SensorID int `db:"SensorID"`
+	ElecID   int    `db:"ElecID"`
+	SensorID int    `db:"SensorID"`
+	Label    string `db:"Label"`
 }
 
 func getHuffmanCodesFromDB(db *sqlx.DB, runNumber int, sensor SensorType) (*HuffmanNode, error) {
@@ -118,8 +120,13 @@ func getHuffmanCodesFromDB(db *sqlx.DB, runNumber int, sensor SensorType) (*Huff
 }
 
 func getSensorsFromDB(db *sqlx.DB, runNumber int) (SensorsMap, error) {
-	query := "SELECT ElecID, SensorID FROM ChannelMapping WHERE MinRun <= %d and MaxRun >= %d ORDER BY SensorID"
-	query = fmt.Sprintf(query, runNumber, runNumber)
+	query := `SELECT cm.ElecID, cm.SensorID, cp.Label
+		FROM ChannelMapping cm
+		JOIN ChannelPosition cp ON cm.SensorID = cp.SensorID
+			AND cp.MinRun <= %d AND cp.MaxRun >= %d
+		WHERE cm.MinRun <= %d AND cm.MaxRun >= %d
+		ORDER BY cm.SensorID`
+	query = fmt.Sprintf(query, runNumber, runNumber, runNumber, runNumber)
 
 	if configuration.Verbosity > 0 {
 		logger.Info("Channel mapping read from DB", "database")
@@ -135,11 +142,12 @@ func getSensorsFromDB(db *sqlx.DB, runNumber int) (SensorsMap, error) {
 		return SensorsMap{}, errMessage
 	}
 
-	npmts := 0
-	nsipms := 0
-	threshold := 999
 	sensorsMap := SensorsMap{
 		Pmts: SensorMapping{
+			ToElecID:   make(map[uint16]uint16),
+			ToSensorID: make(map[uint16]uint16),
+		},
+		Fibers: SensorMapping{
 			ToElecID:   make(map[uint16]uint16),
 			ToSensorID: make(map[uint16]uint16),
 		},
@@ -157,15 +165,17 @@ func getSensorsFromDB(db *sqlx.DB, runNumber int) (SensorsMap, error) {
 			errMessage := fmt.Errorf("error scanning DB row: %w", err)
 			return SensorsMap{}, errMessage
 		}
-		if result.ElecID < threshold {
-			npmts += 1
+		switch {
+		case strings.HasPrefix(result.Label, "PMT"):
 			sensorsMap.Pmts.ToElecID[uint16(result.SensorID)] = uint16(result.ElecID)
 			sensorsMap.Pmts.ToSensorID[uint16(result.ElecID)] = uint16(result.SensorID)
 			if result.SensorID < int(sensorsMap.PmtIDOffset) {
 				sensorsMap.PmtIDOffset = uint16(result.SensorID)
 			}
-		} else {
-			nsipms += 1
+		case strings.HasPrefix(result.Label, "Fiber"):
+			sensorsMap.Fibers.ToElecID[uint16(result.SensorID)] = uint16(result.ElecID)
+			sensorsMap.Fibers.ToSensorID[uint16(result.ElecID)] = uint16(result.SensorID)
+		case strings.HasPrefix(result.Label, "SiPM"):
 			sensorsMap.Sipms.ToElecID[uint16(result.SensorID)] = uint16(result.ElecID)
 			sensorsMap.Sipms.ToSensorID[uint16(result.ElecID)] = uint16(result.SensorID)
 		}

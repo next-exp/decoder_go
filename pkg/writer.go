@@ -139,6 +139,28 @@ func sortSensorsBySensorID(sensorsFromElecIDToSensorID map[uint16]uint16) []Sens
 	return sorted
 }
 
+func sortSensorsBySensorIDForWaveforms(dbMap map[uint16]uint16, waveforms map[uint16][]int16) []SensorMappingHDF5 {
+	// The array MUST be allocated at creation, if not, HDF5 will panic
+	// doing appends will not work
+	sorted := make([]SensorMappingHDF5, len(waveforms))
+	count := 0
+	for elecID := range waveforms {
+		sensorID, exists := dbMap[elecID]
+		if !exists {
+			sensorID = uint16(0xFFFF)
+		}
+		sorted[count] = SensorMappingHDF5{
+			channel:  int32(elecID),
+			sensorID: int32(sensorID),
+		}
+		count++
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].sensorID < sorted[j].sensorID
+	})
+	return sorted
+}
+
 func sortSensorsByElecID(sensors map[uint16][]int16) []SensorMappingHDF5 {
 	// The array MUST be allocated at creation, if not, HDF5 will panic
 	// doing appends will not work
@@ -159,6 +181,30 @@ func sortSensorsByElecID(sensors map[uint16][]int16) []SensorMappingHDF5 {
 		return sorted[i].channel < sorted[j].channel
 	})
 	return sorted
+}
+
+func buildSortedElecIDs(pmtWaveforms map[uint16][]int16, fiberWaveforms map[uint16][]int16) []uint16 {
+	all := make([]uint16, 0, len(pmtWaveforms)+len(fiberWaveforms))
+	for elecID := range pmtWaveforms {
+		all = append(all, elecID)
+	}
+	for elecID := range fiberWaveforms {
+		all = append(all, elecID)
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i] < all[j] })
+	return all
+}
+
+func buildSortedSensorIDs(pmtSensors map[uint16]uint16, fiberSensors map[uint16]uint16) []uint16 {
+	all := make([]uint16, 0, len(pmtSensors)+len(fiberSensors))
+	for _, sensorID := range pmtSensors {
+		all = append(all, sensorID)
+	}
+	for _, sensorID := range fiberSensors {
+		all = append(all, sensorID)
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i] < all[j] })
+	return all
 }
 
 func (w *Writer) WriteEvent(event *EventType) {
@@ -190,13 +236,15 @@ func (w *Writer) WriteEvent(event *EventType) {
 		fiberHGSorted = sortSensorsByElecID(event.FibersHG)
 		nPmts = len(event.PmtWaveforms)
 		nSipms = len(event.SipmWaveforms)
-		nTrgChs = N_TRG_CH
+		nTrgChs = len(buildSortedElecIDs(event.PmtWaveforms, event.FibersLG))
 	} else {
 		pmtSorted = sortSensorsBySensorID(sensorsMap.Pmts.ToSensorID)
 		sipmSorted = sortSensorsBySensorID(sensorsMap.Sipms.ToSensorID)
+		fiberLGSorted = sortSensorsBySensorIDForWaveforms(sensorsMap.Fibers.ToSensorID, event.FibersLG)
+		fiberHGSorted = sortSensorsBySensorIDForWaveforms(sensorsMap.Fibers.ToSensorID, event.FibersHG)
 		nPmts = len(pmtSorted)
 		nSipms = len(sipmSorted)
-		nTrgChs = nPmts
+		nTrgChs = len(buildSortedSensorIDs(sensorsMap.Pmts.ToSensorID, sensorsMap.Fibers.ToSensorID))
 	}
 	nBlrs = len(event.BlrWaveforms)
 	nFibersLG = len(event.FibersLG)
@@ -319,47 +367,66 @@ func (w *Writer) WriteEvent(event *EventType) {
 	}
 
 	if configuration.NoDB {
-		writeTriggerChannelsNoDB(w.TriggerChannels, event.TriggerConfig.TrgChannels, nTrgChs, w.EvtCounter)
+		sortedElecIDs := buildSortedElecIDs(event.PmtWaveforms, event.FibersLG)
+		writeTriggerChannelsNoDB(w.TriggerChannels, event.TriggerConfig.TrgChannels, sortedElecIDs, w.EvtCounter)
 	} else {
-		writeTriggerChannels(w.TriggerChannels, event.TriggerConfig.TrgChannels, nTrgChs,
-			sensorsMap.Pmts.ToSensorID, sensorsMap.PmtIDOffset, w.EvtCounter)
+		sortedSensorIDs := buildSortedSensorIDs(sensorsMap.Pmts.ToSensorID, sensorsMap.Fibers.ToSensorID)
+		writeTriggerChannels(w.TriggerChannels, event.TriggerConfig.TrgChannels,
+			sensorsMap.Pmts.ToSensorID, sensorsMap.Fibers.ToSensorID, sortedSensorIDs, w.EvtCounter)
 	}
 
 	w.EvtCounter++
 }
 
-func writeTriggerChannels(dset *hdf5.Dataset, channels []uint16, nTrgChs int,
-	sensors map[uint16]uint16, pmtIDOffset uint16, evtCounter int) {
+func writeTriggerChannels(dset *hdf5.Dataset, channels []uint16,
+	pmtSensors map[uint16]uint16, fiberSensors map[uint16]uint16,
+	sortedSensorIDs []uint16, evtCounter int) {
+	nTrgChs := len(sortedSensorIDs)
+	posMap := make(map[uint16]int, nTrgChs)
+	for i, sensorID := range sortedSensorIDs {
+		posMap[sensorID] = i
+	}
 	trgChannels := make([]int16, nTrgChs)
 	for _, elecid := range channels {
-		sensor, exists := sensors[uint16(elecid)]
+		sensorID, exists := pmtSensors[elecid]
+		if !exists {
+			// Normalize odd (HG) fiber elecIDs to even before lookup
+			lookupID := elecid
+			if elecid%2 == 1 {
+				lookupID = elecid - 1
+			}
+			sensorID, exists = fiberSensors[lookupID]
+		}
 		if exists {
-			sensorCorrected := sensor - pmtIDOffset
-			if sensorCorrected < uint16(nTrgChs) {
-				trgChannels[sensorCorrected] = 1
-			} else {
-				fmt.Println("Trigger channel out of range: ", elecid, sensor)
+			if pos, ok := posMap[sensorID]; ok {
+				trgChannels[pos] = 1
 			}
 		} else {
-			fmt.Println("Trigger channel not found in mapping: ", elecid, sensor)
+			fmt.Println("Trigger channel not found in mapping: ", elecid)
 		}
 	}
 	write2dArray(dset, &trgChannels, evtCounter, nTrgChs)
 }
 
-func writeTriggerChannelsNoDB(dset *hdf5.Dataset, channels []uint16, nTrgChs int, evtCounter int) {
+func writeTriggerChannelsNoDB(dset *hdf5.Dataset, channels []uint16, sortedElecIDs []uint16, evtCounter int) {
+	nTrgChs := len(sortedElecIDs)
+	posMap := make(map[uint16]int, nTrgChs)
+	for i, elecID := range sortedElecIDs {
+		posMap[elecID] = i
+	}
 	trgChannels := make([]int16, nTrgChs)
 	for _, elecid := range channels {
-		// Map the elecid into 0-47
-		// 100-111 -> 0-11
-		// 200-207 -> 12-23
-		// 300-307 -> 24-35
-		// 400-407 -> 36-47
-		sensor := (elecid/100-1)*12 + (elecid%100)%12
-		if sensor < uint16(nTrgChs) {
-			trgChannels[sensor] = 1
+		lookupID := elecid
+		// Normalize odd (HG) fiber elecIDs to even before lookup
+		if elecid%2 == 1 {
+			if _, ok := posMap[elecid-1]; ok {
+				lookupID = elecid - 1
+			}
+		}
+		if pos, ok := posMap[lookupID]; ok {
+			trgChannels[pos] = 1
 		} else {
-			fmt.Println("Trigger channel out of range: ", sensor)
+			fmt.Println("Trigger channel not found: ", elecid)
 		}
 	}
 	write2dArray(dset, &trgChannels, evtCounter, nTrgChs)
